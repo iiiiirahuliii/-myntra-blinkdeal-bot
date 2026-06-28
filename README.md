@@ -1,0 +1,2 @@
+# -myntra-blinkdeal-bot
+Bot
