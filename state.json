@@ -1,7 +1,7 @@
 {
   "blinkdeal_active": false,
   "block_alert_sent": true,
-  "consecutive_unreadable_checks": 60,
+  "consecutive_unreadable_checks": 61,
   "last_alert_sent_utc": null,
-  "last_checked_utc": "2026-08-10T20:40:55.046183+00:00"
+  "last_checked_utc": "2026-08-10T20:45:50.172612+00:00"
 }
