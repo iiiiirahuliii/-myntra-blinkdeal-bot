@@ -1,21 +1,5 @@
 """
-check.py - Entry point for the Myntra BLINKDEAL monitor.
-
-Run on a schedule by GitHub Actions (see .github/workflows/monitor.yml).
-Each run starts in a brand-new, empty container, so state.json is the only
-thing that remembers whether BLINKDEAL was already active last time we
-checked. See README.md -> "How state persists across runs" for how that
-file survives between runs despite the container being thrown away each time.
-
-IMPORTANT - read this before relying on it:
-This script does not try to defeat Myntra's bot detection (no proxy
-rotation, no browser-fingerprint spoofing, no CAPTCHA solving). It sends an
-ordinary HTTP request with standard browser-style headers. If Myntra's
-anti-bot system blocks the request outright, this script will detect that
-it didn't get a usable page, log it, and (after BLOCK_ALERT_THRESHOLD
-consecutive occurrences) send you a single Telegram heads-up rather than
-fail silently forever. See README.md -> "Known limitation" for details and
-what to check if that happens.
+check.py - Entry point for the Myntra BLINKDEAL monitor with verification reports.
 """
 
 import json
@@ -28,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 import config
@@ -85,20 +70,28 @@ def utc_now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 def fetch_product_page(url: str) -> Optional[requests.Response]:
-    """Fetch the product page with retries/timeouts. Returns None if every attempt fails."""
+    """Fetch the product page using cloudscraper to bypass anti-bot challenges."""
     headers = {
         "User-Agent": config.USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
     }
 
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+
     last_exc = None
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
-            return requests.get(
+            return scraper.get(
                 url, headers=headers, timeout=config.REQUEST_TIMEOUT_SECONDS
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             last_exc = exc
             logger.warning(
                 "Fetch attempt %s/%s failed: %s", attempt, config.MAX_RETRIES, exc
@@ -111,8 +104,7 @@ def fetch_product_page(url: str) -> Optional[requests.Response]:
 
 
 def looks_like_block_page(html: str) -> bool:
-    """Heuristic check for 'this isn't the real product page' responses
-    (anti-bot block pages, maintenance pages, CAPTCHA walls, etc.)."""
+    """Heuristic check for anti-bot block pages, CAPTCHAs, etc."""
     lowered = html.lower()
     block_markers = (
         "site maintenance",
@@ -128,18 +120,6 @@ def looks_like_block_page(html: str) -> bool:
 # ---------------------------------------------------------------------------
 # Parsing / coupon detection
 # ---------------------------------------------------------------------------
-#
-# Myntra (like most React/SSR storefronts) embeds page data as JSON inside
-# <script> tags rather than as plain text in the HTML. The exact variable
-# name can change without notice and can differ between page templates, so
-# this tries several known patterns rather than relying on just one.
-#
-# NOTE: I could not verify these patterns against a live, unblocked response
-# (see module docstring / README "Known limitation") -- they're informed
-# guesses based on common Myntra/React conventions, not confirmed against
-# the real page. Verify and adjust using your own browser (View Source /
-# DevTools) the first time you deploy this -- see README "Verifying the
-# parser yourself".
 
 JSON_BLOB_PATTERNS = [
     re.compile(r"window\.__myx\s*=\s*(\{.*?\})\s*;?\s*</script>", re.DOTALL),
@@ -147,10 +127,6 @@ JSON_BLOB_PATTERNS = [
     re.compile(r"<script[^>]+id=[\"']__NEXT_DATA__[\"'][^>]*>(.*?)</script>", re.DOTALL),
 ]
 
-# When walking parsed JSON, only check string values that live under a key
-# that looks coupon/offer-related. This avoids false positives from the
-# coupon code appearing somewhere unrelated (e.g. a list of "coupons you
-# don't qualify for", a comment, analytics payload, etc.).
 INTERESTING_KEY_HINT = re.compile(r"coupon|offer|deal|promo", re.IGNORECASE)
 
 
@@ -193,19 +169,12 @@ def detect_coupon_in_json(blobs: list, coupon_code: str) -> bool:
         found: list = []
         _walk_for_coupon(blob, coupon_code, found)
         if found:
-            logger.info(
-                "Coupon '%s' found inside embedded JSON (under a coupon/offer/"
-                "deal/promo key).",
-                coupon_code,
-            )
+            logger.info("Coupon '%s' found inside embedded JSON.", coupon_code)
             return True
     return False
 
 
 def detect_coupon_in_visible_offer_blocks(html: str, coupon_code: str) -> bool:
-    """Lower-confidence fallback used only if no embedded JSON was found at
-    all: look inside HTML elements that look like offer/coupon UI (by class
-    name), instead of searching the whole page's text indiscriminately."""
     soup = BeautifulSoup(html, "html.parser")
     candidates = soup.find_all(
         lambda tag: tag.has_attr("class")
@@ -216,11 +185,7 @@ def detect_coupon_in_visible_offer_blocks(html: str, coupon_code: str) -> bool:
     )
     for tag in candidates:
         if coupon_code.upper() in tag.get_text(" ", strip=True).upper():
-            logger.info(
-                "Coupon '%s' found in an offer/coupon-styled HTML element "
-                "(fallback method -- no embedded JSON was found on this page).",
-                coupon_code,
-            )
+            logger.info("Coupon '%s' found in HTML element.", coupon_code)
             return True
     return False
 
@@ -230,21 +195,15 @@ def coupon_is_active(html: str, coupon_code: str) -> bool:
     if blobs:
         return detect_coupon_in_json(blobs, coupon_code)
 
-    logger.warning(
-        "No recognizable embedded JSON found on the page; falling back to "
-        "scanning offer/coupon-styled HTML elements. This is lower-confidence "
-        "-- see README 'Known limitation' if this keeps happening, since it "
-        "usually means the page didn't render normally."
-    )
+    logger.warning("No embedded JSON found; falling back to HTML scan.")
     return detect_coupon_in_visible_offer_blocks(html, coupon_code)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Execution Block
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    send_telegram_message(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, "🧪 Test notification from BLINKDEAL Bot! Everything is working!")
     state = load_state()
     state["last_checked_utc"] = utc_now_iso()
 
@@ -255,13 +214,42 @@ def main() -> int:
         or looks_like_block_page(response.text)
     )
 
+    # 1. Determine the status message for the verification alert
     if page_unusable:
         state["consecutive_unreadable_checks"] += 1
-        logger.warning(
-            "Could not get a usable page (unreadable check #%s in a row).",
-            state["consecutive_unreadable_checks"],
-        )
+        status_code_str = response.status_code if response else 'None'
+        status_msg = f"⚠️ Unreadable / Blocked (HTTP Status: {status_code_str})"
+        active_now = False
+        logger.warning("Could not get a usable page (#%s in a row).", state["consecutive_unreadable_checks"])
+    else:
+        state["consecutive_unreadable_checks"] = 0
+        state["block_alert_sent"] = False
+        try:
+            active_now = coupon_is_active(response.text, config.COUPON_CODE)
+            status_msg = f"✅ Page Loaded! Coupon '{config.COUPON_CODE}' Active: {active_now}"
+        except Exception:
+            logger.exception("Unexpected error while parsing the page.")
+            status_msg = "❌ Error parsing product page HTML/JSON."
+            active_now = False
 
+    # 2. Send the Detailed Test / Verification Message to Telegram
+    try:
+        send_telegram_message(
+            config.TELEGRAM_BOT_TOKEN,
+            config.TELEGRAM_CHAT_ID,
+            f"🔍 BLINKDEAL Check Report:\n"
+            f"• Target: {config.PRODUCT_URL}\n"
+            f"• Result: {status_msg}\n"
+            f"• Time (UTC): {state['last_checked_utc']}",
+            timeout=config.REQUEST_TIMEOUT_SECONDS,
+            max_retries=config.MAX_RETRIES,
+            backoff_seconds=config.RETRY_BACKOFF_SECONDS,
+        )
+    except NotifierError as exc:
+        logger.error("Could not send Telegram status report: %s", exc)
+
+    # 3. Handle block threshold alerts & deal state transitions
+    if page_unusable:
         if (
             state["consecutive_unreadable_checks"] >= config.BLOCK_ALERT_THRESHOLD
             and not state["block_alert_sent"]
@@ -270,57 +258,39 @@ def main() -> int:
                 send_telegram_message(
                     config.TELEGRAM_BOT_TOKEN,
                     config.TELEGRAM_CHAT_ID,
-                    "BLINKDEAL bot heads-up: the last "
-                    f"{state['consecutive_unreadable_checks']} checks in a row "
-                    "couldn't read the Myntra page (likely blocked, or the page "
-                    "changed). Check the GitHub Actions logs.",
+                    "⚠️ BLINKDEAL bot heads-up: Multiple consecutive checks failed to read Myntra.",
                     timeout=config.REQUEST_TIMEOUT_SECONDS,
                     max_retries=config.MAX_RETRIES,
                     backoff_seconds=config.RETRY_BACKOFF_SECONDS,
                 )
                 state["block_alert_sent"] = True
             except NotifierError as exc:
-                logger.error("Could not send block heads-up alert: %s", exc)
+                logger.error("Could not send block alert: %s", exc)
 
         save_state(state)
         return 0
 
-    # We got back something that looks like a real page.
-    state["consecutive_unreadable_checks"] = 0
-    state["block_alert_sent"] = False
-
-    try:
-        active_now = coupon_is_active(response.text, config.COUPON_CODE)
-    except Exception:
-        # Never let a parsing bug crash the whole run / corrupt state.
-        logger.exception("Unexpected error while parsing the page.")
-        save_state(state)
-        return 1
-
     was_active = state["blinkdeal_active"]
 
     if active_now and not was_active:
-        logger.info("BLINKDEAL just appeared. Sending alert.")
+        logger.info("BLINKDEAL just appeared! Sending primary deal alert.")
         try:
             send_telegram_message(
                 config.TELEGRAM_BOT_TOKEN,
                 config.TELEGRAM_CHAT_ID,
-                f"BLINKDEAL is live!\n{config.PRODUCT_URL}",
+                f"🎉 BLINKDEAL IS LIVE!\n{config.PRODUCT_URL}",
                 timeout=config.REQUEST_TIMEOUT_SECONDS,
                 max_retries=config.MAX_RETRIES,
                 backoff_seconds=config.RETRY_BACKOFF_SECONDS,
             )
         except NotifierError as exc:
             logger.error("Could not send BLINKDEAL alert: %s", exc)
-            # Don't flip blinkdeal_active to True if the alert failed to
-            # send -- the next run will see active_now again and retry,
-            # instead of silently going quiet for the rest of the deal.
             save_state(state)
             return 1
         state["last_alert_sent_utc"] = utc_now_iso()
         state["blinkdeal_active"] = True
     elif active_now and was_active:
-        logger.info("BLINKDEAL still active; alert already sent earlier, skipping.")
+        logger.info("BLINKDEAL still active; alert already sent earlier.")
     elif not active_now and was_active:
         logger.info("BLINKDEAL no longer detected; resetting state.")
         state["blinkdeal_active"] = False
