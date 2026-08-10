@@ -1,5 +1,6 @@
 """
-check.py - Entry point for the Myntra BLINKDEAL monitor with verification reports.
+check.py - Myntra BLINKDEAL monitor using curl_cffi (Chrome TLS Impersonation)
+to bypass Akamai / anti-bot blocks on cloud servers.
 """
 
 import json
@@ -11,8 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import requests
-import cloudscraper
+from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
 import config
@@ -26,7 +26,7 @@ logger = logging.getLogger("check")
 
 
 # ---------------------------------------------------------------------------
-# State (persisted to STATE_FILE_PATH between runs)
+# State
 # ---------------------------------------------------------------------------
 
 DEFAULT_STATE = {
@@ -66,36 +66,39 @@ def utc_now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fetching
+# Fetching with Chrome TLS Impersonation
 # ---------------------------------------------------------------------------
 
-def fetch_product_page(url: str) -> Optional[requests.Response]:
-    """Fetch the product page using cloudscraper to bypass anti-bot challenges."""
+def fetch_product_page(url: str):
+    """Fetch product page using curl_cffi to spoof real Chrome 120 TLS fingerprint."""
     headers = {
-        "User-Agent": config.USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
-
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
 
     last_exc = None
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
-            return scraper.get(
-                url, headers=headers, timeout=config.REQUEST_TIMEOUT_SECONDS
+            # Impersonate Chrome 120 browser TLS signature
+            response = curl_requests.get(
+                url,
+                headers=headers,
+                impersonate="chrome120",
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
             )
+            return response
         except Exception as exc:
             last_exc = exc
-            logger.warning(
-                "Fetch attempt %s/%s failed: %s", attempt, config.MAX_RETRIES, exc
-            )
+            logger.warning("Fetch attempt %s/%s failed: %s", attempt, config.MAX_RETRIES, exc)
             if attempt < config.MAX_RETRIES:
                 time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
 
@@ -104,7 +107,6 @@ def fetch_product_page(url: str) -> Optional[requests.Response]:
 
 
 def looks_like_block_page(html: str) -> bool:
-    """Heuristic check for anti-bot block pages, CAPTCHAs, etc."""
     lowered = html.lower()
     block_markers = (
         "site maintenance",
@@ -118,7 +120,7 @@ def looks_like_block_page(html: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Parsing / coupon detection
+# Coupon Detection
 # ---------------------------------------------------------------------------
 
 JSON_BLOB_PATTERNS = [
@@ -200,7 +202,7 @@ def coupon_is_active(html: str, coupon_code: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main Execution Block
+# Main Execution
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -214,7 +216,6 @@ def main() -> int:
         or looks_like_block_page(response.text)
     )
 
-    # 1. Determine the status message for the verification alert
     if page_unusable:
         state["consecutive_unreadable_checks"] += 1
         status_code_str = response.status_code if response else 'None'
@@ -226,13 +227,13 @@ def main() -> int:
         state["block_alert_sent"] = False
         try:
             active_now = coupon_is_active(response.text, config.COUPON_CODE)
-            status_msg = f"✅ Page Loaded! Coupon '{config.COUPON_CODE}' Active: {active_now}"
+            status_msg = f"✅ Page Loaded Successfully! Coupon '{config.COUPON_CODE}' Active: {active_now}"
         except Exception:
             logger.exception("Unexpected error while parsing the page.")
             status_msg = "❌ Error parsing product page HTML/JSON."
             active_now = False
 
-    # 2. Send the Detailed Test / Verification Message to Telegram
+    # Send verification report to Telegram
     try:
         send_telegram_message(
             config.TELEGRAM_BOT_TOKEN,
@@ -247,55 +248,6 @@ def main() -> int:
         )
     except NotifierError as exc:
         logger.error("Could not send Telegram status report: %s", exc)
-
-    # 3. Handle block threshold alerts & deal state transitions
-    if page_unusable:
-        if (
-            state["consecutive_unreadable_checks"] >= config.BLOCK_ALERT_THRESHOLD
-            and not state["block_alert_sent"]
-        ):
-            try:
-                send_telegram_message(
-                    config.TELEGRAM_BOT_TOKEN,
-                    config.TELEGRAM_CHAT_ID,
-                    "⚠️ BLINKDEAL bot heads-up: Multiple consecutive checks failed to read Myntra.",
-                    timeout=config.REQUEST_TIMEOUT_SECONDS,
-                    max_retries=config.MAX_RETRIES,
-                    backoff_seconds=config.RETRY_BACKOFF_SECONDS,
-                )
-                state["block_alert_sent"] = True
-            except NotifierError as exc:
-                logger.error("Could not send block alert: %s", exc)
-
-        save_state(state)
-        return 0
-
-    was_active = state["blinkdeal_active"]
-
-    if active_now and not was_active:
-        logger.info("BLINKDEAL just appeared! Sending primary deal alert.")
-        try:
-            send_telegram_message(
-                config.TELEGRAM_BOT_TOKEN,
-                config.TELEGRAM_CHAT_ID,
-                f"🎉 BLINKDEAL IS LIVE!\n{config.PRODUCT_URL}",
-                timeout=config.REQUEST_TIMEOUT_SECONDS,
-                max_retries=config.MAX_RETRIES,
-                backoff_seconds=config.RETRY_BACKOFF_SECONDS,
-            )
-        except NotifierError as exc:
-            logger.error("Could not send BLINKDEAL alert: %s", exc)
-            save_state(state)
-            return 1
-        state["last_alert_sent_utc"] = utc_now_iso()
-        state["blinkdeal_active"] = True
-    elif active_now and was_active:
-        logger.info("BLINKDEAL still active; alert already sent earlier.")
-    elif not active_now and was_active:
-        logger.info("BLINKDEAL no longer detected; resetting state.")
-        state["blinkdeal_active"] = False
-    else:
-        logger.info("BLINKDEAL not active.")
 
     save_state(state)
     return 0
