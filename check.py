@@ -244,6 +244,7 @@ def coupon_is_active(html: str, coupon_code: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+        send_telegram_message(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, "🧪 Test notification from BLINKDEAL Bot! Everything is working!")
     state = load_state()
     state["last_checked_utc"] = utc_now_iso()
 
