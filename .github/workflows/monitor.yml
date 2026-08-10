@@ -1,0 +1,48 @@
+name: Monitor BLINKDEAL
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub Actions cron can lag during high load -- see
+    # README "Known limitation" for what that means in practice.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the updated state.json back to the repo
+
+concurrency:
+  group: blinkdeal-monitor
+  cancel-in-progress: false   # never cancel a run that's mid-check/mid-alert
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run BLINKDEAL check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check.py
+
+      - name: Persist state.json back to the repo
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update state.json [skip ci]"
+            git push
+          else
+            echo "No state change, nothing to commit."
+          fi
