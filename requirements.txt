@@ -2,3 +2,4 @@ requests
 beautifulsoup4
 requests
 cloudscraper
+curl_cffi
